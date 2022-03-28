@@ -33,30 +33,56 @@
 #define I2S_NUM (0)
 #define I2S_WS_PERIOD ((16 * I2S_NUM_CHANNEL) / (HC595_CLKFREQ / (1000 * 1000))) // 16 bit data - 4 us
 #define DMA_BUFFER_LENGTH 64
-#define DMA_BUFFER_COUNT 2
+#define DMA_BUFFER_COUNT 8
 #define DMA_BUFFER_PREPARE (DMA_BUFFER_LENGTH * 2) // 64 queues * 2 channels
+#define QUEUE_DMA_MULTIPLIER 64
+#define QUEUE_BUFFER_NUMBER 8
 
 #define HC595_NUM_RCLK 21
 #define HC595_NUM_SRCLK 22
 #define HC595_NUM_SER 23
 
+uint16_t *HC595_TEMP_BUFFER;
+uint16_t *HC595_BEGIN_BUFFER;
+uint16_t *HC595_END_BUFFER;
+
+DRAM_ATTR uint8_t FORCE_QUEUE_SEND = false;
 QueueHandle_t xQueue1;
+SemaphoreHandle_t xSemaphore1;
 int64_t timeStartSend, timeEndSend;
 int64_t timeStartReceive, timeEndReceive;
+DRAM_ATTR uint16_t tempData = 0x0000;
 
 static const char *TAG = "[HC595_I2S]";
 
-void queueDelayI2S(uint32_t delayUs, uint16_t data)
+IRAM_ATTR void HC595_SendDataToQueue() // Add new data to Queue
+{
+    // uint16_t HC595_TEMP_BUFFER = HC595_LCD_DATA_BUFFER | HC595_LCD_CTRL_BUFFER << 8;
+    // xSemaphoreTake(xSemaphore1, portMAX_DELAY);
+    *HC595_TEMP_BUFFER++ = tempData;
+    if ((HC595_TEMP_BUFFER - HC595_BEGIN_BUFFER >= QUEUE_BUFFER_NUMBER) || FORCE_QUEUE_SEND)
+    {
+        *HC595_END_BUFFER = HC595_TEMP_BUFFER - HC595_BEGIN_BUFFER;
+        // ESP_LOGI("[HC595_END_BUFFER]", "%d - %d", *HC595_END_BUFFER, HC595_TEMP_BUFFER - HC595_BEGIN_BUFFER);
+        // ESP_LOG_BUFFER_HEX("[HC595_BUFFER]", HC595_BEGIN_BUFFER, (QUEUE_BUFFER_NUMBER + 1) * sizeof(uint16_t));
+        xQueueSend(xQueue1, HC595_BEGIN_BUFFER, portMAX_DELAY);
+        // ESP_LOGI("[FORCE_QUEUE_SEND]", "%d", FORCE_QUEUE_SEND);
+        FORCE_QUEUE_SEND = false;
+        HC595_TEMP_BUFFER = HC595_BEGIN_BUFFER;
+    }
+    // xSemaphoreGive(xSemaphore1);
+}
+
+void queueDelayI2S(uint32_t delayUs)
 {
     for (uint32_t i = 0; i < delayUs / I2S_WS_PERIOD; i++)
     {
-        xQueueSend(xQueue1, &data, portMAX_DELAY);
+        HC595_SendDataToQueue();
     }
 }
 
 static void taskSendData()
 {
-    uint16_t tempData = 0x0000;
     // uint16_t *sampleData = malloc(sizeof(uint16_t) * 1000);
     // memset(sampleData, 0xFFFF, sizeof(uint16_t) * 1000);
     // timeStartSend = esp_timer_get_time();
@@ -69,15 +95,25 @@ static void taskSendData()
     // ESP_LOGI(TAG, "Receive: %lld us", timeEndReceive - timeStartReceive);
     while (1)
     {
-        tempData = 0xFFFF;
-        xQueueSend(xQueue1, &tempData, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        tempData = 0x0000;
-        xQueueSend(xQueue1, &tempData, portMAX_DELAY);
-        queueDelayI2S(300, 0xAAAA);
-        tempData = 0x0000;
-        xQueueSend(xQueue1, &tempData, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // tempData = 0xFFFF;
+        // HC595_SendDataToQueue();
+        // vTaskDelay(pdMS_TO_TICKS(500));
+        // // ESP_LOGI("[NEXT]", "0x0000");
+        // tempData = 0x0000;
+        // HC595_SendDataToQueue();
+        // tempData = 0xBBBB;
+        // queueDelayI2S(300);
+        // tempData = 0xAAAA;
+        // HC595_SendDataToQueue();
+        // vTaskDelay(pdMS_TO_TICKS(500));
+        timeStartSend = esp_timer_get_time();
+        for (uint32_t i = 0; i < 619520; i++)
+        {
+            tempData = 0xFFFF;
+            HC595_SendDataToQueue();
+        }
+        timeEndSend = esp_timer_get_time();
+        ESP_LOGI(TAG, "Sending: %lld us", timeEndSend - timeStartSend);
     }
     vTaskDelete(NULL);
 }
@@ -102,27 +138,58 @@ static void taskSendHC595()
             sampleData = sampleDataBegin + DMA_BUFFER_PREPARE + 1; // Start from second-half, add 1 more shift
             dmaSelect = 0;
         }
-        for (uint16_t i = 0; i < DMA_BUFFER_PREPARE / 2; i++)
+        for (uint16_t i = 0; i < DMA_BUFFER_PREPARE / (2 * QUEUE_BUFFER_NUMBER); i++)
         {
             if (uxQueueMessagesWaiting(xQueue1) > 0)
             {
-                xQueueReceive(xQueue1, sampleData, portMAX_DELAY); // Get new data
-                lastData = *sampleData;
-                sampleData++;
-                *sampleData = 0x0000;
-                sampleData++;
+                uint16_t *TEMP_SAMPLE_DATA = heap_caps_malloc((QUEUE_BUFFER_NUMBER + 1) * sizeof(uint16_t), MALLOC_CAP_8BIT);
+                uint16_t *TEMP_SAMPLE_DATA_BEGIN = TEMP_SAMPLE_DATA;
+                uint16_t *TEMP_SAMPLE_DATA_END = TEMP_SAMPLE_DATA + QUEUE_BUFFER_NUMBER;
+                // timeStartReceive = esp_timer_get_time();
+                xQueueReceive(xQueue1, TEMP_SAMPLE_DATA, portMAX_DELAY); // Get new data
+                // ESP_LOG_BUFFER_HEX("[RECEIVE]", TEMP_SAMPLE_DATA, (QUEUE_BUFFER_NUMBER + 1) * sizeof(uint16_t));
+                //  timeEndReceive = esp_timer_get_time();
+                //  ESP_LOGI("[QueueReceive]", "%lld us %d", timeEndReceive - timeStartReceive, uxQueueMessagesWaiting(xQueue1));
+                for (uint16_t i = 0; i < QUEUE_BUFFER_NUMBER; i++)
+                {
+                    if (i < *TEMP_SAMPLE_DATA_END)
+                    {
+                        *sampleData = *TEMP_SAMPLE_DATA;
+                        lastData = *TEMP_SAMPLE_DATA;
+                        TEMP_SAMPLE_DATA++;
+                        sampleData++;
+                        *sampleData = 0x0000;
+                        sampleData++;
+                    }
+                    else
+                    {
+                        *sampleData = *(TEMP_SAMPLE_DATA - 1);
+                        sampleData++;
+                        *sampleData = 0x0000;
+                        sampleData++;
+                    }
+                    // ESP_LOGI("[sampleData]")
+                }
+                // lastData = *(sampleData - 2);
+                heap_caps_free(TEMP_SAMPLE_DATA_BEGIN);
             }
             else
             {
-                *sampleData = lastData;
-                sampleData++;
-                *sampleData = 0x0000;
-                sampleData++;
+                for (uint16_t i = 0; i < QUEUE_BUFFER_NUMBER; i++)
+                {
+                    *sampleData = lastData;
+                    sampleData++;
+                    *sampleData = 0x0000;
+                    sampleData++;
+                }
+                FORCE_QUEUE_SEND = true;
+                HC595_SendDataToQueue();
             }
-            // ESP_LOGI(TAG, "%d - %d - %d", *(sampleData - 2), i, dmaSelect);
-            // vTaskDelay(1);
         }
         sampleData = sampleData - DMA_BUFFER_PREPARE - 1; // Remove the shift
+        // ESP_LOG_BUFFER_HEX("[OUT]", sampleData, DMA_BUFFER_PREPARE * sizeof(uint16_t));
+        // ESP_LOGI("[Stop]", "NO");
+        // vTaskDelay(pdMS_TO_TICKS(5000));
         timeStartReceive = esp_timer_get_time();
         i2s_write(I2S_NUM, sampleData, DMA_BUFFER_PREPARE * sizeof(uint16_t), &i2s_bytes_write, portMAX_DELAY);
         timeEndReceive = esp_timer_get_time();
@@ -133,7 +200,13 @@ static void taskSendHC595()
 
 void app_main(void)
 {
-    xQueue1 = xQueueCreate(DMA_BUFFER_PREPARE, sizeof(uint16_t));
+    xSemaphore1 = xSemaphoreCreateMutex();
+    xQueue1 = xQueueCreate(DMA_BUFFER_PREPARE * QUEUE_DMA_MULTIPLIER, sizeof(uint16_t) * (QUEUE_BUFFER_NUMBER + 1));
+    HC595_TEMP_BUFFER = heap_caps_malloc((QUEUE_BUFFER_NUMBER + 1) * sizeof(uint16_t), MALLOC_CAP_8BIT);
+    HC595_BEGIN_BUFFER = HC595_TEMP_BUFFER;
+    HC595_END_BUFFER = HC595_TEMP_BUFFER + QUEUE_BUFFER_NUMBER;
+    memset(HC595_TEMP_BUFFER, 0x0000, (QUEUE_BUFFER_NUMBER + 1) * sizeof(uint16_t));
+    HC595_TEMP_BUFFER = HC595_BEGIN_BUFFER;
     i2s_config_t i2s_config = {
         .mode = I2S_MODE_MASTER | I2S_MODE_TX,
         .sample_rate = (HC595_CLKFREQ / I2S_NUM_CHANNEL / I2S_NUM_BIT),
